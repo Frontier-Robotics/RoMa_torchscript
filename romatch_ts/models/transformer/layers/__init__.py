@@ -7,6 +7,11 @@
 from .dino_head import DINOHead
 from .mlp import Mlp
 from .patch_embed import PatchEmbed
-from .swiglu_ffn import SwiGLUFFN, SwiGLUFFNFused
-from .block import NestedTensorBlock
+from .swiglu_ffn import SwiGLUFFNFused  # or whatever file defines it
 from .attention import MemEffAttention
+from .block import Block, NestedTensorBlock
+
+__all__ = [
+    "Mlp", "PatchEmbed", "SwiGLUFFNFused",
+    "MemEffAttention", "Block", "NestedTensorBlock",
+]

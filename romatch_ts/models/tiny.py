@@ -10,7 +10,7 @@ import numpy as np
 from torch import nn
 from PIL import Image
 from torchvision.transforms import ToTensor
-from romatch.utils.kde import kde
+from romatch_ts.utils.kde import kde
 
 class BasicLayer(nn.Module):
     """

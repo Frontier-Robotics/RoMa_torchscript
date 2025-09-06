@@ -1,10 +1,10 @@
 import warnings
 import torch.nn as nn
 import torch
-from romatch.models.matcher import *
-from romatch.models.transformer import Block, TransformerDecoder, MemEffAttention
-from romatch.models.encoders import *
-from romatch.models.tiny import TinyRoMa
+from romatch_ts.models.matcher import *
+from romatch_ts.models.transformer import Block, TransformerDecoder, MemEffAttention
+from romatch_ts.models.encoders import *
+from romatch_ts.models.tiny import TinyRoMa
 
 def tiny_roma_v1_model(weights = None, freeze_xfeat=False, exact_softmax=False, xfeat = None):
     model = TinyRoMa(
@@ -23,14 +23,18 @@ def roma_model(resolution, upsample_preds, device = None, weights=None, dinov2_w
     gp_dim = 512
     feat_dim = 512
     decoder_dim = gp_dim + feat_dim
+
     cls_to_coord_res = 64
+    num_bins = cls_to_coord_res * cls_to_coord_res  # 4096
+
     coordinate_decoder = TransformerDecoder(
-        nn.Sequential(*[Block(decoder_dim, 8, attn_class=MemEffAttention) for _ in range(5)]), 
-        decoder_dim, 
-        cls_to_coord_res**2 + 1,
+        nn.Sequential(*[Block(1024, 8, attn_class=MemEffAttention) for _ in range(5)]),
+        hidden_dim=1024,
+        num_classes=num_bins + 1,
         is_classifier=True,
-        amp = True,
-        pos_enc = False,)
+        amp=True,
+        pos_enc=False,
+    )
     dw = True
     hidden_blocks = 8
     kernel_size = 5
@@ -126,6 +130,8 @@ def roma_model(resolution, upsample_preds, device = None, weights=None, dinov2_w
         gp_dim=gp_dim,
         basis=basis,
         no_cov=no_cov,
+        amp=True,
+        amp_dtype=amp_dtype,
     )
     gps = nn.ModuleDict({"16": gp16})
     proj16 = nn.Sequential(nn.Conv2d(1024, 512, 1, 1), nn.BatchNorm2d(512))
@@ -166,5 +172,17 @@ def roma_model(resolution, upsample_preds, device = None, weights=None, dinov2_w
     sample_mode = "threshold_balanced"
     matcher = RegressionMatcher(encoder, decoder, h=h, w=w, upsample_preds=upsample_preds, 
                                 symmetric = symmetric, attenuate_cert = attenuate_cert, sample_mode = sample_mode, **kwargs).to(device)
+    #-   matcher.load_state_dict(weights)
+   # --- Partial load: RoMa ckpt doesn’t include encoder.dinov2.* (loaded separately) or CosKernel buffer ---
+    model_sd = matcher.state_dict()
+    filtered = {}
+    for k, v in weights.items():
+        kk = k.replace("module.", "").replace("matcher.", "")
+        if kk in model_sd and model_sd[kk].shape == v.shape:
+            filtered[kk] = v
+    miss_unexp = matcher.load_state_dict(filtered, strict=False)
+    print("[roma_model] non-strict load ->", miss_unexp)
+    return matcher
+    
     matcher.load_state_dict(weights)
     return matcher

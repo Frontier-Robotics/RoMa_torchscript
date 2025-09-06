@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from PIL import Image
 import kornia
 
+
+
+# add these if not present
+from typing import Optional, Tuple, Union, Dict
+
+
 def recover_pose(E, kpts0, kpts1, K0, K1, mask):
     best_num_inliers = 0
     K0inv = np.linalg.inv(K0[:2,:2])
@@ -298,28 +304,65 @@ def cls_to_flow(cls, deterministic_sampling = True):
     flow = G[sampled_cls]
     return flow
 
-@torch.no_grad()
-def cls_to_flow_refine(cls):
-    B,C,H,W = cls.shape
+import math
+
+
+
+
+@torch.jit.script
+def cls_to_flow_refine(cls: torch.Tensor) -> torch.Tensor:
+    # cls: [B, C, H, W], C is either s*s or s*s+1
+    B, C, H, W = cls.shape
     device = cls.device
-    res = round(math.sqrt(C))
-    G = torch.meshgrid(
-        *[torch.linspace(-1+1/res, 1-1/res, steps = res, device = device) for _ in range(2)],
-        indexing = 'ij'
-        )
-    G = torch.stack([G[1],G[0]],dim=-1).reshape(C,2)
-    # FIXME: below softmax line causes mps to bug, don't know why.
-    if device.type == 'mps':
-        cls = cls.log_softmax(dim=1).exp()
-    else:
-        cls = cls.softmax(dim=1)
-    mode = cls.max(dim=1).indices
-    
-    index = torch.stack((mode-1, mode, mode+1, mode - res, mode + res), dim = 1).clamp(0,C - 1).long()
-    neighbours = torch.gather(cls, dim = 1, index = index)[...,None]
-    flow = neighbours[:,0] * G[index[:,0]] + neighbours[:,1] * G[index[:,1]] + neighbours[:,2] * G[index[:,2]] + neighbours[:,3] * G[index[:,3]] + neighbours[:,4] * G[index[:,4]]
-    tot_prob = neighbours.sum(dim=1)  
-    flow = flow / tot_prob
+
+    # infer square resolution
+    s = int(torch.floor(torch.sqrt(torch.tensor(float(C)))))
+    s2 = s * s
+    if s2 + 1 == C:
+        # drop background/dustbin
+        cls = cls[:, :s2, :, :]
+        C = s2
+    elif s2 != C:
+        # last try: round
+        s = int(torch.round(torch.sqrt(torch.tensor(float(C)))))
+        s2 = s * s
+        if s2 != C:
+            raise RuntimeError(f"Classifier channels must be square or square+1, got C={C}.")
+
+    # coordinate grid in [-1,1]
+    rf = float(s)
+    xs = torch.linspace(-1.0 + 1.0 / rf, 1.0 - 1.0 / rf, steps=s, device=device)
+    ys = torch.linspace(-1.0 + 1.0 / rf, 1.0 - 1.0 / rf, steps=s, device=device)
+    gy, gx = torch.meshgrid(ys, xs, indexing='ij')  # [s,s]
+    G = torch.stack((gx, gy), dim=-1).reshape(C, 2)  # [C,2]
+
+    # probs
+    cls = torch.softmax(cls, dim=1)                  # [B,C,H,W]
+    mode = torch.argmax(cls, dim=1)                  # [B,H,W]
+
+    # 5-neighbour refinement around argmax
+    res = s
+    idx0 = torch.clamp(mode - 1, 0, C - 1)
+    idx1 = mode
+    idx2 = torch.clamp(mode + 1, 0, C - 1)
+    idx3 = torch.clamp(mode - res, 0, C - 1)
+    idx4 = torch.clamp(mode + res, 0, C - 1)
+    index = torch.stack((idx0, idx1, idx2, idx3, idx4), dim=1)  # [B,5,H,W]
+
+    # gather class probabilities at those indices
+    neigh = torch.gather(cls, 1, index).unsqueeze(-1)           # [B,5,H,W,1]
+
+    # weighted average of coordinates
+    flow = (
+        neigh[:, 0] * G[idx0] +
+        neigh[:, 1] * G[idx1] +
+        neigh[:, 2] * G[idx2] +
+        neigh[:, 3] * G[idx3] +
+        neigh[:, 4] * G[idx4]
+    )  # [B,H,W,2]
+
+    denom = neigh.sum(dim=1).clamp_min(1e-8)                    # [B,H,W,1]
+    flow = flow / denom
     return flow
 
 
@@ -625,33 +668,55 @@ def signed_left_to_right_epipolar_distance(pts1, pts2, Fm):
 
     return signed_point_line_distance(pts2, line1_in_2)
 
-def get_grid(b, h, w, device):
-    grid = torch.meshgrid(
-        *[
-            torch.linspace(-1 + 1 / n, 1 - 1 / n, n, device=device)
-            for n in (b, h, w)
-        ],
-        indexing = 'ij'
-    )
-    grid = torch.stack((grid[2], grid[1]), dim=-1).reshape(b, h, w, 2)
-    return grid
+@torch.jit.script
+def get_grid(b: int, h: int, w: int, device: torch.device) -> torch.Tensor:
+    xs = torch.linspace(-1.0 + 1.0 / float(w), 1.0 - 1.0 / float(w), w, device=device)
+    ys = torch.linspace(-1.0 + 1.0 / float(h), 1.0 - 1.0 / float(h), h, device=device)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")  # <- add indexing
+    grid_hw2 = torch.stack((grid_x, grid_y), dim=-1)  # (h, w, 2)
+    return grid_hw2.unsqueeze(0).expand(b, h, w, 2).contiguous()
 
 
-def get_autocast_params(device=None, enabled=False, dtype=None):
-    if device is None:
-        autocast_device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        #strip :X from device
-        autocast_device = str(device).split(":")[0]
-    if 'cuda' in str(device):
-        out_dtype = dtype
-        enabled = True
-    else:
-        out_dtype = torch.bfloat16
-        enabled = False
-        # mps is not supported
-        autocast_device = "cpu"
-    return autocast_device, enabled, out_dtype
+
+def get_autocast_params(
+    device: Union[str, torch.device],
+    enabled: bool,
+    dtype: torch.dtype,
+) -> Tuple[str, bool, torch.dtype]:
+    # derive device kind from the argument only (no torch.cuda.* calls)
+    dev_str = str(device)
+    if ":" in dev_str:
+        dev_str = dev_str.split(":")[0]  # e.g. "cuda:0" -> "cuda"
+
+    is_cuda = (dev_str == "cuda")
+
+    # do NOT mutate the 'enabled' parameter—use a new local
+    autocast_enabled: bool = bool(enabled and is_cuda)
+
+    # use provided dtype on CUDA; CPU autocast prefers bfloat16
+    autocast_dtype: torch.dtype = dtype if is_cuda else torch.bfloat16
+
+    # torch.autocast expects "cuda" or "cpu"
+    autocast_device = "cuda" if is_cuda else "cpu"
+    return autocast_device, autocast_enabled, autocast_dtype
+
+
+
+# def get_autocast_params(device=None, enabled=False, dtype=None):
+#     if device is None:
+#         autocast_device = "cuda" if torch.cuda.is_available() else "cpu"
+#     else:
+#         #strip :X from device
+#         autocast_device = str(device).split(":")[0]
+#     if 'cuda' in str(device):
+#         out_dtype = dtype
+#         enabled = True
+#     else:
+#         out_dtype = torch.bfloat16
+#         enabled = False
+#         # mps is not supported
+#         autocast_device = "cpu"
+#     return autocast_device, enabled, out_dtype
 
 def check_not_i16(im):
     if im.mode == "I;16":

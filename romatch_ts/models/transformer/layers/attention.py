@@ -12,7 +12,8 @@ import logging
 
 from torch import Tensor
 from torch import nn
-
+import torch
+from typing import Optional, Tuple, Union
 
 logger = logging.getLogger("dinov2")
 
@@ -20,10 +21,10 @@ logger = logging.getLogger("dinov2")
 try:
     from xformers.ops import memory_efficient_attention, unbind, fmha
 
-    XFORMERS_AVAILABLE = True
+    _XFORMERS_AVAILABLE = True
 except ImportError:
-    # logger.warning("xFormers not available")
-    XFORMERS_AVAILABLE = False
+    logger.warning("xFormers not available")
+    _XFORMERS_AVAILABLE = False
 
 
 class Attention(nn.Module):
@@ -49,33 +50,45 @@ class Attention(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-
         q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        attn = q @ k.transpose(-2, -1)
-
-        attn = attn.softmax(dim=-1)
+        attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
         attn = self.attn_drop(attn)
-
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
 
-class MemEffAttention(Attention):
-    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        if not XFORMERS_AVAILABLE:
-            assert attn_bias is None, "xFormers is required for nested tensors usage"
-            return super().forward(x)
 
+
+class MemEffAttention(Attention):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # local boolean; avoids closed-over global in TorchScript
+        self.use_xformers: bool = bool(_XFORMERS_AVAILABLE)
+
+    def forward(self, x: Tensor, attn_bias: Optional[Tensor] = None) -> Tensor:
+        # TorchScript or no xFormers -> fallback with inlined base attention
+        if torch.jit.is_scripting() or not self.use_xformers:
+            if attn_bias is not None:
+                raise RuntimeError("attn_bias is unsupported without xFormers")
+            B, N, C = x.shape
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
+            attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+
+        # Fast path with xFormers (eager-only)
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
-
-        q, k, v = unbind(qkv, 2)
-
+        q, k, v = torch.unbind(qkv, dim=2)  # use torch.unbind, not xformers.unbind
+        q = q * self.scale
         x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
-        x = x.reshape([B, N, C])
-
+        x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

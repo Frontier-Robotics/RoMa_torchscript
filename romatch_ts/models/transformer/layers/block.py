@@ -19,18 +19,34 @@ from .drop_path import DropPath
 from .layer_scale import LayerScale
 from .mlp import Mlp
 
-
+from typing import List 
 logger = logging.getLogger("dinov2")
 
 
+# romatch_ts/models/transformer/layers/block.py
+from typing import Callable, List, Any, Tuple, Dict
+import torch
+from torch import nn, Tensor
+import torch.nn.functional as F
+
 try:
     from xformers.ops import fmha
-    from xformers.ops import scaled_index_add, index_select_cat
-
     XFORMERS_AVAILABLE = True
 except ImportError:
-    # logger.warning("xFormers not available")
     XFORMERS_AVAILABLE = False
+
+# ---- add this: keep the cache and helpers out of TorchScript
+if not XFORMERS_AVAILABLE:
+    attn_bias_cache = {}  # type: ignore[var-annotated]
+
+    @torch.jit.ignore
+    def get_attn_bias_and_cat(x_list, branges=None):
+        raise RuntimeError("Nested-tensor path requires xFormers; disabled for TorchScript.")
+
+    @torch.jit.ignore
+    def drop_add_residual_stochastic_depth_list(*args, **kwargs):
+        raise RuntimeError("Nested-tensor path requires xFormers; disabled for TorchScript.")
+
 
 
 class Block(nn.Module):
@@ -80,32 +96,39 @@ class Block(nn.Module):
         self.sample_drop_ratio = drop_path
 
     def forward(self, x: Tensor) -> Tensor:
-        def attn_residual_func(x: Tensor) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x)))
+            if self.training and self.sample_drop_ratio > 0.1:
+                # ---- attention residual with stochastic-depth (inline, no closures)
+                b, n, d = x.shape
+                keep = max(int(b * (1 - self.sample_drop_ratio)), 1)
+                idx = torch.randperm(b, device=x.device)[:keep]
+                x_sub = x[idx]
+                res = self.ls1(self.attn(self.norm1(x_sub)))
+                x_flat = x.flatten(1)
+                res_flat = res.flatten(1)
+                scale = b / keep
+                x = torch.index_add(x_flat, 0, idx, res_flat.to(dtype=x.dtype), alpha=scale).view_as(x)
 
-        def ffn_residual_func(x: Tensor) -> Tensor:
-            return self.ls2(self.mlp(self.norm2(x)))
+                # ---- ffn residual with stochastic-depth (inline)
+                b, n, d = x.shape
+                keep = max(int(b * (1 - self.sample_drop_ratio)), 1)
+                idx = torch.randperm(b, device=x.device)[:keep]
+                x_sub = x[idx]
+                res = self.ls2(self.mlp(self.norm2(x_sub)))
+                x_flat = x.flatten(1)
+                res_flat = res.flatten(1)
+                scale = b / keep
+                x = torch.index_add(x_flat, 0, idx, res_flat.to(dtype=x.dtype), alpha=scale).view_as(x)
+                return x
 
-        if self.training and self.sample_drop_ratio > 0.1:
-            # the overhead is compensated only for a drop path rate larger than 0.1
-            x = drop_add_residual_stochastic_depth(
-                x,
-                residual_func=attn_residual_func,
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-            x = drop_add_residual_stochastic_depth(
-                x,
-                residual_func=ffn_residual_func,
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-        elif self.training and self.sample_drop_ratio > 0.0:
-            x = x + self.drop_path1(attn_residual_func(x))
-            x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
-        else:
-            x = x + attn_residual_func(x)
-            x = x + ffn_residual_func(x)
-        return x
+            if self.training and self.sample_drop_ratio > 0.0:
+                x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+                x = x + self.drop_path1(self.ls2(self.mlp(self.norm2(x))))  # same drop path as original
+                return x
 
+            # eval / no drop-path
+            x = x + self.ls1(self.attn(self.norm1(x)))
+            x = x + self.ls2(self.mlp(self.norm2(x)))
+            return x
 
 def drop_add_residual_stochastic_depth(
     x: Tensor,
@@ -201,52 +224,30 @@ def drop_add_residual_stochastic_depth_list(
     return outputs
 
 
+# class NestedTensorBlock(Block):
+#     def forward_nested(self, x_list: List[Tensor]) -> List[Tensor]:
+#         # TorchScript-friendly version; no nested defs
+#         assert isinstance(self.attn, MemEffAttention)
+#         if self.training and self.sample_drop_ratio > 0.0:
+#             # Simple per-tensor path (no stochastic subset tricks during scripting)
+#             out_list: List[Tensor] = []
+#             for x in x_list:
+#                 x = x + self.ls1(self.attn(self.norm1(x)))  # attn_bias not used in per-tensor path
+#                 x = x + self.ls2(self.mlp(self.norm2(x)))
+#                 out_list.append(x)
+#             return out_list
+#         else:
+#             # Fast batched path with xFormers bias (no inner defs)
+#             attn_bias, x = get_attn_bias_and_cat(x_list)
+#             x = x + self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
+#             x = x + self.ls2(self.mlp(self.norm2(x)))
+#             return attn_bias.split(x)
+
+
 class NestedTensorBlock(Block):
-    def forward_nested(self, x_list: List[Tensor]) -> List[Tensor]:
-        """
-        x_list contains a list of tensors to nest together and run
-        """
-        assert isinstance(self.attn, MemEffAttention)
-
-        if self.training and self.sample_drop_ratio > 0.0:
-
-            def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.attn(self.norm1(x), attn_bias=attn_bias)
-
-            def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.mlp(self.norm2(x))
-
-            x_list = drop_add_residual_stochastic_depth_list(
-                x_list,
-                residual_func=attn_residual_func,
-                sample_drop_ratio=self.sample_drop_ratio,
-                scaling_vector=self.ls1.gamma if isinstance(self.ls1, LayerScale) else None,
-            )
-            x_list = drop_add_residual_stochastic_depth_list(
-                x_list,
-                residual_func=ffn_residual_func,
-                sample_drop_ratio=self.sample_drop_ratio,
-                scaling_vector=self.ls2.gamma if isinstance(self.ls1, LayerScale) else None,
-            )
-            return x_list
-        else:
-
-            def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
-
-            def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.ls2(self.mlp(self.norm2(x)))
-
-            attn_bias, x = get_attn_bias_and_cat(x_list)
-            x = x + attn_residual_func(x, attn_bias=attn_bias)
-            x = x + ffn_residual_func(x)
-            return attn_bias.split(x)
-
     def forward(self, x_or_x_list):
         if isinstance(x_or_x_list, Tensor):
-            return super().forward(x_or_x_list)
-        elif isinstance(x_or_x_list, list):
-            assert XFORMERS_AVAILABLE, "Please install xFormers for nested tensors usage"
-            return self.forward_nested(x_or_x_list)
-        else:
-            raise AssertionError
+            # TorchScript-safe: call base class directly, not super()
+            return Block.forward(self, x_or_x_list)
+        # keep nested-tensor path disabled for JIT
+        raise RuntimeError("Nested-tensor path is disabled for TorchScript on this build.")

@@ -11,15 +11,21 @@
 from functools import partial
 import math
 import logging
-from typing import Sequence, Tuple, Union, Callable
+from typing import Sequence, Tuple, Union, Callable, Optional
 
 import torch
 import torch.nn as nn
+
+import torch.nn.functional as F
+
+from torch import Tensor
+
 import torch.utils.checkpoint
 from torch.nn.init import trunc_normal_
 
-from .layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
-
+#from .layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
+from .layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention
+from .layers.block import Block
 
 
 def named_apply(fn: Callable, module: nn.Module, name="", depth_first=True, include_root=False) -> nn.Module:
@@ -163,33 +169,42 @@ class DinoVisionTransformer(nn.Module):
         nn.init.normal_(self.cls_token, std=1e-6)
         named_apply(init_weights_vit_timm, self)
 
-    def interpolate_pos_encoding(self, x, w, h):
+    def interpolate_pos_encoding(self, x: torch.Tensor, w: int, h: int) -> torch.Tensor:
+
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
         if npatch == N and w == h:
             return self.pos_embed
+
         pos_embed = self.pos_embed.float()
         class_pos_embed = pos_embed[:, 0]
         patch_pos_embed = pos_embed[:, 1:]
         dim = x.shape[-1]
+
+        # number of patches per spatial dim
         w0 = w // self.patch_size
         h0 = h // self.patch_size
-        # we add a small number to avoid floating point error in the interpolation
-        # see discussion at https://github.com/facebookresearch/dino/issues/8
-        w0, h0 = w0 + 0.1, h0 + 0.1
 
-        patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
-            scale_factor=(w0 / math.sqrt(N), h0 / math.sqrt(N)),
-            mode="bicubic",
+        # ensure plain Python ints (TorchScript-safe)
+        w0i = int(w0)
+        h0i = int(h0)
+
+        grid = int(math.sqrt(N))  # N should be a perfect square
+        patch_pos = patch_pos_embed.reshape(1, grid, grid, dim).permute(0, 3, 1, 2)
+
+        patch_pos = F.interpolate(
+            patch_pos, size=(int(w // self.patch_size), int(h // self.patch_size)),
+            mode="bicubic", align_corners=False
         )
 
-        assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+        # sanity check (optional)
+        assert w0i == int(patch_pos.shape[-2]) and h0i == int(patch_pos.shape[-1])
 
-    def prepare_tokens_with_masks(self, x, masks=None):
+        patch_pos = patch_pos.permute(0, 2, 3, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos), dim=1).to(previous_dtype)
+
+    def prepare_tokens_with_masks(self, x: torch.Tensor, masks: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, nc, w, h = x.shape
         x = self.patch_embed(x)
         if masks is not None:
@@ -219,6 +234,7 @@ class DinoVisionTransformer(nn.Module):
             )
         return output
 
+    @torch.jit.ignore
     def forward_features(self, x, masks=None):
         if isinstance(x, list):
             return self.forward_features_list(x, masks)
@@ -235,6 +251,22 @@ class DinoVisionTransformer(nn.Module):
             "x_prenorm": x,
             "masks": masks,
         }
+
+    @torch.jit.export
+    def forward_patchtokens(self, x: torch.Tensor) -> torch.Tensor:
+        # masks are not used in your eval path, keep it None for TS simplicity
+        x = self.prepare_tokens_with_masks(x, None)
+        for blk in self.blocks:
+            x = blk(x)
+        x_norm = self.norm(x)
+        return x_norm[:, 1:]  # (B, num_patches, C)
+
+    def _forward_cls_token(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.prepare_tokens_with_masks(x, None)
+        for blk in self.blocks:
+            x = blk(x)
+        x_norm = self.norm(x)
+        return x_norm[:, 0]
 
     def _get_intermediate_layers_not_chunked(self, x, n=1):
         x = self.prepare_tokens_with_masks(x)
@@ -288,13 +320,14 @@ class DinoVisionTransformer(nn.Module):
             return tuple(zip(outputs, class_tokens))
         return tuple(outputs)
 
-    def forward(self, *args, is_training=False, **kwargs):
-        ret = self.forward_features(*args, **kwargs)
-        if is_training:
-            return ret
-        else:
-            return self.head(ret["x_norm_clstoken"])
-
+    # @torch.jit.export
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     feats = self.forward_features(x)
+    #     return self.head(feats["x_norm_clstoken"])
+    @torch.jit.export
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cls_tok = self._forward_cls_token(x)
+        return self.head(cls_tok)
 
 def init_weights_vit_timm(module: nn.Module, name: str = ""):
     """ViT weight initialization, original timm impl (for reproducibility)"""
